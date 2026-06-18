@@ -1,12 +1,11 @@
 """
-parse.py
+parse.py  –  third draft
 
-Parses a folder of court watching .docx files into a flat CSV dataset.
-Each row represents one case. Header-level metadata is shared across all
-cases in the same document.
+Parses a folder of court-watching .docx files into a flat CSV dataset.
+One row per case; header metadata is shared across all cases in the file.
 
 Usage:
-    python parse.py                        # reads ./mini_data, writes output.csv
+    python parse.py                          # reads ./mini_data, writes output.csv
     python parse.py --input ./mini_data --output results.csv
 
 Requires: pip install python-docx
@@ -18,19 +17,20 @@ import argparse
 from pathlib import Path
 from docx import Document
 
+NaN = float("nan")
 
 # ---------------------------------------------------------------------------
-# Text cleaning
+# Text normalisation
 # ---------------------------------------------------------------------------
 
 def clean(text: str) -> str:
-    """Normalise whitespace and common unicode artifacts; do NOT replace values."""
+    """Normalise whitespace and common unicode artifacts; never replace values."""
     return (text
-            .replace("\u00a0", " ")   # non-breaking space
+            .replace("\u00a0", " ")
             .replace("\u2019", "'").replace("\u2018", "'")
             .replace("\u201c", '"').replace("\u201d", '"')
-            .replace("\u2605", "").replace("\u2b51", "")  # star decorators
-            .replace("✭", "")
+            .replace("\u2605", "").replace("\u2b51", "")
+            .replace("✭", "").replace("⭑", "")
             .strip())
 
 
@@ -38,11 +38,18 @@ def para_text(para) -> str:
     return clean(para.text)
 
 
+def nan_if_empty(val: str):
+    """Return NaN for blank / whitespace-only strings, otherwise the string."""
+    s = val.strip() if isinstance(val, str) else ""
+    return s if s else NaN
+
+
 # ---------------------------------------------------------------------------
-# Document splitter: paragraphs → header block + per-case blocks
+# Document-level splitter: paragraphs → header block + per-case blocks
 # ---------------------------------------------------------------------------
 
-CASE_RE = re.compile(r"^\s*[*_]?Case\s*:\s*\d+", re.IGNORECASE)
+CASE_RE = re.compile(r"^\s*[*_]*Case\s*:\s*(\d+)", re.IGNORECASE)
+
 
 def split_into_cases(doc: Document):
     """
@@ -51,8 +58,8 @@ def split_into_cases(doc: Document):
         case_blocks   : list of (case_number_str, [paragraphs])
     """
     header_paras = []
-    case_blocks = []
-    current_num = None
+    case_blocks  = []
+    current_num  = None
     current_paras = []
 
     for para in doc.paragraphs:
@@ -61,8 +68,7 @@ def split_into_cases(doc: Document):
         if m:
             if current_num is not None:
                 case_blocks.append((current_num, current_paras))
-            num_m = re.search(r"\d+", t)
-            current_num = num_m.group(0) if num_m else ""
+            current_num   = m.group(1)
             current_paras = [para]
         elif current_num is None:
             header_paras.append(para)
@@ -76,26 +82,23 @@ def split_into_cases(doc: Document):
 
 
 # ---------------------------------------------------------------------------
-# Section splitter within a case block
+# Section splitter within a case block (by roman numeral headings)
 # ---------------------------------------------------------------------------
 
-# Matches "I.", "II.", "III.", "IV.", "V.", "VI." at the start of a paragraph
-ROMAN_RE = re.compile(r"^\s*(I{1,3}|IV|VI?)\s*\.", re.IGNORECASE)
+ROMAN_MAP = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6}
+ROMAN_RE  = re.compile(r"^\s*(VI?|IV|I{1,3})\s*\.", re.IGNORECASE)
+
 
 def split_into_sections(paragraphs):
-    """
-    Split case paragraphs into a dict keyed by roman numeral index (1-6).
-    Section 0 = preamble before Section I.
-    """
+    """Returns dict {0: [paras before §I], 1: [...], ..., 6: [...]}."""
     sections = {0: []}
-    current = 0
-    roman_map = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6}
+    current  = 0
 
     for para in paragraphs:
         t = para_text(para)
         m = ROMAN_RE.match(t)
         if m:
-            key = roman_map.get(m.group(1).upper(), 0)
+            key = ROMAN_MAP.get(m.group(1).upper(), 0)
             current = key
             sections.setdefault(current, [])
         else:
@@ -104,50 +107,95 @@ def split_into_sections(paragraphs):
     return sections
 
 
-def section_text(sections, num):
-    """Return all paragraph texts for a section joined by newline."""
-    return "\n".join(para_text(p) for p in sections.get(num, []))
+def section_lines(sections, num) -> list[str]:
+    """Return list of non-empty paragraph texts for a section."""
+    return [para_text(p) for p in sections.get(num, [])]
+
+
+def section_blob(sections, num) -> str:
+    return "\n".join(section_lines(sections, num))
 
 
 # ---------------------------------------------------------------------------
-# Header parsing (before Case: 1)
+# Field extraction helpers
 # ---------------------------------------------------------------------------
+
+def first_match(patterns, text, default=""):
+    """
+    Try each regex; return first capture group (stripped) or default.
+    Uses MULTILINE so ^ / $ work per-line; no DOTALL so [^\n]* stays on one line.
+    """
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            return clean(m.group(1))
+    return default
+
+
+def collect_until(lines: list[str], start_idx: int, stop_re) -> str:
+    """
+    Starting at lines[start_idx+1], collect text until stop_re matches a line.
+    Returns joined, collapsed-whitespace string.
+    """
+    parts = []
+    for i in range(start_idx + 1, len(lines)):
+        if stop_re and stop_re.search(lines[i]):
+            break
+        parts.append(lines[i])
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+# ---------------------------------------------------------------------------
+# Header parsing (paragraphs before Case: 1)
+# ---------------------------------------------------------------------------
+
+REPEATED_ARGS_RE = re.compile(
+    r"write down any arguments repeated", re.IGNORECASE)
+GENERAL_OBS_RE   = re.compile(
+    r"general observations and takeaways", re.IGNORECASE)
+COURTROOM_COND_RE = re.compile(r"courtroom conditions", re.IGNORECASE)
+ABILITY_RE       = re.compile(r"ability to hear", re.IGNORECASE)
+WINDOWS_RE       = re.compile(r"does the courtroom have windows", re.IGNORECASE)
+COURTROOM_TYPE_RE = re.compile(
+    r"what type of courtroom were the hearings held in", re.IGNORECASE)
+NAV_RE           = re.compile(r"courthouse navigator", re.IGNORECASE)
+
 
 def parse_header(paragraphs) -> dict:
-    """
-    Walk header paragraphs sequentially, capturing fields.
-    Multi-line fields (ability_to_hear, courtroom_type) consume lines
-    until the next recognised field header.
-    """
     header = {
-        "source_file": "",
-        "documenter_name": "",
-        "hearing_date": "",
-        "arrived_at": "",
-        "left_at": "",
-        "judge_header": "",
-        "courtroom_number": "",
+        "source_file"        : "",
+        "documenter_name"    : "",
+        "hearing_date"       : "",
+        "arrived_at"         : "",
+        "left_at"            : "",
+        "judge_header"       : "",
+        "courtroom_number"   : "",
+        "repeated_arguments" : "",
+        "general_observations": "",
         "courthouse_navigator": "",
-        "ability_to_hear": "",
+        "ability_to_hear"    : "",
         "courtroom_has_windows": "",
-        "courtroom_type": "",
+        "courtroom_type"     : "",
     }
 
     lines = [para_text(p) for p in paragraphs]
+    n = len(lines)
 
-    # Sentinel patterns that mark the START of the next field
-    NEXT_FIELD_RE = re.compile(
+    # Sentinels: patterns that begin a new header field (used to stop multi-line captures)
+    NEXT_HDR = re.compile(
         r"(does the courtroom have windows|what type of courtroom|"
-        r"arrived at court|left court|judge\s*:|courtroom\s*#|date:|"
-        r"courthouse navigator|ability to hear)",
+        r"courthouse navigator|ability to hear|courtroom conditions|"
+        r"general observations|write down any arguments|"
+        r"arrived at court|left court|judge\s*:|courtroom\s*#|^date:)",
         re.IGNORECASE,
     )
 
     i = 0
-    while i < len(lines):
-        t = lines[i]
-        tl = t.lower()
+    while i < n:
+        t    = lines[i]
+        tl   = t.lower()
 
+        # ---- Simple single-line fields ----
         if tl.startswith("documenter name:"):
             header["documenter_name"] = t.split(":", 1)[1].strip()
 
@@ -155,10 +203,12 @@ def parse_header(paragraphs) -> dict:
             header["hearing_date"] = t.split(":", 1)[1].strip()
 
         elif "arrived at court house at" in tl:
-            header["arrived_at"] = re.split(r"arrived at court house at\s*:", t, flags=re.IGNORECASE)[1].strip()
+            header["arrived_at"] = re.split(
+                r"arrived at court house at\s*:", t, flags=re.IGNORECASE)[1].strip()
 
         elif "left court house at" in tl:
-            header["left_at"] = re.split(r"left court house at\s*:", t, flags=re.IGNORECASE)[1].strip()
+            header["left_at"] = re.split(
+                r"left court house at\s*:", t, flags=re.IGNORECASE)[1].strip()
 
         elif re.match(r"^judge\s*:", t, re.IGNORECASE):
             header["judge_header"] = t.split(":", 1)[1].strip()
@@ -166,53 +216,78 @@ def parse_header(paragraphs) -> dict:
         elif re.match(r"^courtroom\s*#", t, re.IGNORECASE):
             m = re.search(r"courtroom\s*#\s*:?\s*(\S+)", t, re.IGNORECASE)
             if m:
-                header["courtroom_number"] = m.group(1)
+                header["courtroom_number"] = m.group(1).rstrip()
 
-        elif "courthouse navigator" in tl:
-            m = re.search(r"courthouse navigator\s*(?:name)?\s*:?\s*(.+)", t, re.IGNORECASE)
+        # ---- Courthouse Navigator (on a bullet line "- Name: X") ----
+        elif NAV_RE.search(t):
+            m = re.search(r"courthouse navigator\s*(?:name)?\s*:?\s*(.+)",
+                           t, re.IGNORECASE)
             if m:
                 header["courthouse_navigator"] = m.group(1).strip()
 
-        elif "ability to hear" in tl:
-            # Collect the inline value (after the ?) plus any following bullet lines
-            # until we hit the next recognised field
-            inline = re.split(r"ability to hear\s*\??", t, flags=re.IGNORECASE, maxsplit=1)[-1].strip().lstrip(":").strip()
-            parts = [inline] if inline else []
+        # ---- Multi-line fields: collect bullets until next sentinel ----
+        elif REPEATED_ARGS_RE.search(t):
+            parts = []
             j = i + 1
-            while j < len(lines):
-                nxt = lines[j]
-                if NEXT_FIELD_RE.search(nxt):
+            while j < n:
+                if GENERAL_OBS_RE.search(lines[j]) or COURTROOM_COND_RE.search(lines[j]):
                     break
-                stripped = nxt.lstrip("-• \t").strip()
+                stripped = lines[j].lstrip("-• \t").strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
+            header["repeated_arguments"] = " | ".join(parts)
+
+        elif GENERAL_OBS_RE.search(t):
+            parts = []
+            j = i + 1
+            while j < n:
+                if COURTROOM_COND_RE.search(lines[j]) or ABILITY_RE.search(lines[j]):
+                    break
+                stripped = lines[j].lstrip("-• \t").strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
+            header["general_observations"] = " | ".join(parts)
+
+        elif ABILITY_RE.search(t):
+            inline = re.split(r"ability to hear\s*\??", t,
+                               flags=re.IGNORECASE, maxsplit=1)[-1].strip().lstrip(":").strip()
+            parts  = [inline] if inline else []
+            j = i + 1
+            while j < n:
+                if NEXT_HDR.search(lines[j]) and not ABILITY_RE.search(lines[j]):
+                    break
+                stripped = lines[j].lstrip("-• \t").strip()
                 if stripped:
                     parts.append(stripped)
                 j += 1
             header["ability_to_hear"] = " ".join(parts).strip()
 
-        elif "does the courtroom have windows" in tl:
-            # Same pattern: inline + following bullet lines until next field
-            inline = re.split(r"does the courtroom have windows\s*\??", t, flags=re.IGNORECASE, maxsplit=1)[-1].strip().lstrip(":").strip()
-            parts = [inline] if inline else []
+        elif WINDOWS_RE.search(t):
+            inline = re.split(r"does the courtroom have windows\s*\??", t,
+                               flags=re.IGNORECASE, maxsplit=1)[-1].strip().lstrip(":").strip()
+            parts  = [inline] if inline else []
             j = i + 1
-            while j < len(lines):
-                nxt = lines[j]
-                if NEXT_FIELD_RE.search(nxt):
+            while j < n:
+                if NEXT_HDR.search(lines[j]) and not WINDOWS_RE.search(lines[j]):
                     break
-                stripped = nxt.lstrip("-• \t").strip()
+                stripped = lines[j].lstrip("-• \t").strip()
                 if stripped:
                     parts.append(stripped)
                 j += 1
             header["courtroom_has_windows"] = " ".join(parts).strip()
 
-        elif "what type of courtroom" in tl:
-            inline = re.split(r"what type of courtroom were the hearings held in\s*\??", t, flags=re.IGNORECASE, maxsplit=1)[-1].strip().lstrip(":").strip()
+        elif COURTROOM_TYPE_RE.search(t):
+            inline = re.split(
+                r"what type of courtroom were the hearings held in\s*\??",
+                t, flags=re.IGNORECASE, maxsplit=1)[-1].strip().lstrip(":").strip()
             parts = [inline] if inline else []
             j = i + 1
-            while j < len(lines):
-                nxt = lines[j]
-                if NEXT_FIELD_RE.search(nxt):
+            while j < n:
+                if NEXT_HDR.search(lines[j]) and not COURTROOM_TYPE_RE.search(lines[j]):
                     break
-                stripped = nxt.lstrip("-• \t").strip()
+                stripped = lines[j].lstrip("-• \t").strip()
                 if stripped:
                     parts.append(stripped)
                 j += 1
@@ -224,196 +299,408 @@ def parse_header(paragraphs) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Case parsing — one section at a time
+# Case parsing – one section at a time
 # ---------------------------------------------------------------------------
 
-def first_match(patterns, text, default="", multiline_ok=False):
-    """Try each pattern; return first capture group or default.
-    By default patterns are single-line (no DOTALL). Pass multiline_ok=True
-    for patterns that intentionally span lines.
+# Regexes for Section III boundary markers (stop conditions)
+S3_WHERE_RE    = re.compile(r"^where\s*\?", re.IGNORECASE)
+S3_CONTACT_RE  = re.compile(r"what reason did officers give for initiating contact", re.IGNORECASE)
+S3_GUN_RE      = re.compile(r"was a gun found", re.IGNORECASE)
+S3_GUN_LOC_RE  = re.compile(r"if yes.*where was the gun found|where was the gun found",
+                              re.IGNORECASE)
+S3_OTHER_RE    = re.compile(r"other important facts about the interaction with police",
+                              re.IGNORECASE)
+
+# Regexes for Section V boundary markers
+S5_WHO_RE       = re.compile(r"who was there\?.*what was shared", re.IGNORECASE)
+S5_JUDGE_CMT_RE = re.compile(r"what comments.*judge make about family", re.IGNORECASE)
+S5_DEPENDANTS_RE= re.compile(
+    r"does the accused person have children", re.IGNORECASE)
+S5_OTHER_RE     = re.compile(
+    r"what else did you learn about the person", re.IGNORECASE)
+
+# Narrative headers in Section IV
+S4_STATE_RE   = re.compile(r"state'?s?\s+narrative", re.IGNORECASE)
+S4_DEFENSE_RE = re.compile(r"defense'?s?\s+narrative", re.IGNORECASE)
+S4_JUDGE_RE   = re.compile(r"judge'?s?\s+3\s+prongs?", re.IGNORECASE)
+
+EDITOR_NOTE_RE = re.compile(r"\[.*?editor\'?s?\s+note", re.IGNORECASE)
+
+
+def collect_narrative(all_paras: list, header_re, stop_re) -> str:
     """
-    flags = re.IGNORECASE | re.MULTILINE
-    if multiline_ok:
-        flags |= re.DOTALL
-    for pat in patterns:
-        m = re.search(pat, text, flags)
-        if m:
-            return clean(m.group(1))
-    return default
+    Scan all_paras (raw paragraph texts, including blanks) for the line matching
+    header_re, then collect ALL subsequent lines until stop_re matches or end of
+    list. No content is filtered out. Trailing blank lines are stripped.
+    """
+    collecting = False
+    parts = []
+    for t in all_paras:
+        if not collecting:
+            if header_re.search(t):
+                collecting = True
+            continue
+        if stop_re and stop_re.search(t):
+            break
+        parts.append(t)
+
+    joined = "\n".join(parts).strip()
+    joined = re.sub(r"\n{3,}", "\n\n", joined)
+    return joined
 
 
 def parse_case(case_num: str, paragraphs: list) -> dict:
-    secs = split_into_sections(paragraphs)
+    secs  = split_into_sections(paragraphs)
 
-    # ---- Section I: People & Case Information ----
-    s1 = section_text(secs, 1)
-
-    time_began = first_match([
-        r"time hearing began\s*:?\s*(.+?)(?:\s{2,}|\s*time ended)",
-        r"time hearing began\s*:?\s*([^\n]+)",
-    ], s1)
-    time_ended = first_match([
-        r"time ended\s*:?\s*([^\n]+)",
-    ], s1)
-    judge_case = first_match([r"^judge\s*:[^\S\n]*(\S[^\n]*)$"], s1)
-    prosecutor = first_match([r"^prosecutor\s*:[^\S\n]*(\S[^\n]*)$"], s1)
-    defense_attorney = first_match([r"^defense attorney\s*:[^\S\n]*(\S[^\n]*)$"], s1)
-    defense_attorney_type = first_match([
-        r"(?:defense attorney is a|is the defense attorney a|the defense attorney is an?)\s*:?\s*\*?\*?([^\n]+?)\*?\*?$",
-    ], s1)
-    accused_initials = first_match([
-        r"accused person(?:\s+full\s+name)?\s*:\s*([^\n]+)",
-    ], s1)
-    gender_presentation = first_match([r"gender presentation\s*:\s*\*?\*?([^\n]+?)\*?\*?$"], s1)
-    perceived_race = first_match([r"perceived race\s*:\s*\*?\*?([^\n]+?)\*?\*?$"], s1)
-    pretrial_fta = first_match([r"failure to appear\s*:\s*([^\n]+)"], s1)
-    pretrial_nca = first_match([r"new criminal activity\s*:\s*([^\n]+)"], s1)
-    pretrial_score = first_match([
-        r"(?:pre-?trial\s+)?supervision score\s*(?:level\s*)?rec(?:ommendation)?\s*:\s*([^\n]+)",
-    ], s1)
-
-    # ---- Section II: Charges ----
-    s2 = section_text(secs, 2)
-
-    primary_charge = first_match([
-        r"primary charge\s*:\s*\*?\*?\s*([^\n]+)",
-    ], s2)
-    additional_charges = first_match([
-        r"any additional charges\s*:\s*\*?\*?\s*([^\n]+)",
-    ], s2)
-
-    # ---- Section III: Facts of the Arrest ----
-    s3 = section_text(secs, 3)
-
-    arrest_datetime = first_match([
-        r"when did this occur[^?]*\?\s*([^\n]+)",
-    ], s3)
-    arrest_location = first_match([
-        r"where\s*\?\s*([^\n]+)",
-    ], s3)
-    # Reason: everything from the label until the next bullet label
-    contact_m = re.search(
-        r"what reason did officers give for initiating contact\??\s*\n(.*?)(?=\n\s*-?\s*was a gun found|\Z)",
-        s3, re.IGNORECASE | re.DOTALL,
-    )
-    reason_for_contact = re.sub(r"\s+", " ", contact_m.group(1)).strip() if contact_m else ""
-
-    gun_found = first_match([
-        r"was a gun found[^:]*:\s*\*?\*?([^\n]+?)\*?\*?$",
-        r"was a gun found[^\n]*\n\s*\*?\*?([^\n]+?)\*?\*?$",
-    ], s3)
-    gun_location = first_match([
-        r"(?:if yes,?\s*)?where was the gun found\??\s*\n\s*[-•]?\s*\*?\*?([^\n]+?)\*?\*?$",
-    ], s3)
-    other_facts_m = re.search(
-        r"other important facts about the interaction with police\??\s*\n(.*?)(?=\Z)",
-        s3, re.IGNORECASE | re.DOTALL,
-    )
-    other_arrest_facts = re.sub(r"\s+", " ", other_facts_m.group(1)).strip() if other_facts_m else ""
-
-    # ---- Section IV: Three Prongs + Narratives ----
-    # The boilerplate "1: ... 2: ... 3: ..." lines are skipped.
-    # We capture State's Narrative, Defense's Narrative, Judge's 3 Prongs.
-    s4 = section_text(secs, 4)
-
-    state_narrative_m = re.search(
-        r"state'?s? narrative\s*:?\s*\n(.*?)(?=\n\s*defense'?s? narrative|\Z)",
-        s4, re.IGNORECASE | re.DOTALL,
-    )
-    state_narrative = re.sub(r"\s+", " ", state_narrative_m.group(1)).strip() if state_narrative_m else ""
-
-    defense_narrative_m = re.search(
-        r"defense'?s? narrative\s*:?\s*\n(.*?)(?=\n\s*judge'?s? 3 prongs|\Z)",
-        s4, re.IGNORECASE | re.DOTALL,
-    )
-    defense_narrative = re.sub(r"\s+", " ", defense_narrative_m.group(1)).strip() if defense_narrative_m else ""
-
-    judge_prongs_m = re.search(
-        r"judge'?s? 3 prongs\s*:?\s*\n(.*?)(?=\Z)",
-        s4, re.IGNORECASE | re.DOTALL,
-    )
-    judge_3_prongs = re.sub(r"\s+", " ", judge_prongs_m.group(1)).strip() if judge_prongs_m else ""
-
-    # ---- Section V: Family & Community Presence ----
-    s5 = section_text(secs, 5)
-
-    family_present = first_match([
-        r"were family/friends present and acknowledged\??\s*\*?\*?([^\n]+?)\*?\*?$",
-    ], s5)
-
-    family_who_m = re.search(
-        r"who was there\? what was shared about the people present\?\s*\n(.*?)(?=\n\s*what comments|\Z)",
-        s5, re.IGNORECASE | re.DOTALL,
-    )
-    family_who = re.sub(r"\s+", " ", family_who_m.group(1)).strip() if family_who_m else ""
-
-    judge_family_m = re.search(
-        r"what comments[^?]*judge make about family[^?]*\?\s*\n(.*?)(?=\n\s*does the accused|\Z)",
-        s5, re.IGNORECASE | re.DOTALL,
-    )
-    judge_comments_on_family = re.sub(r"\s+", " ", judge_family_m.group(1)).strip() if judge_family_m else ""
-
-    dependants = first_match([
-        r"does the accused person have children[^:]*:\s*\*?\*?([^\n]+?)\*?\*?$",
-    ], s5)
-
-    other_info_m = re.search(
-        r"what else did you learn about the person[^:]*:\s*\*?\*?\s*\n(.*?)(?=\Z)",
-        s5, re.IGNORECASE | re.DOTALL,
-    )
-    other_info_about_person = re.sub(r"\s+", " ", other_info_m.group(1)).strip() if other_info_m else ""
-
-    # ---- Section VI: Outcome ----
-    s6 = section_text(secs, 6)
-    # Take everything; trim trailing boilerplate "Note to reader" footer
-    outcome = re.sub(r"\s+", " ", s6).strip()
-    outcome = re.sub(
-        r"\s*Note to reader\s*:.*$", "", outcome, flags=re.IGNORECASE | re.DOTALL
+    # Collect preamble lines between "Case: N" and Section I, excluding the heading itself.
+    preamble_lines = [para_text(p) for p in secs.get(0, [])]
+    preamble_lines = [l for l in preamble_lines if not CASE_RE.match(l)]
+    # Any Editor's Notes in the preamble are appended to time_hearing_began below.
+    preamble_editor_notes = " ".join(
+        l for l in preamble_lines if EDITOR_NOTE_RE.search(l)
     ).strip()
 
+    # ------------------------------------------------------------------ §I
+    s1_lines = section_lines(secs, 1)
+    s1 = "\n".join(s1_lines)
+
+    time_began_base = first_match([
+        r"time hearing began\s*:?\s*(.+?)(?:\s{2,}|\s*time ended)",
+        r"time hearing began\s*:[^\S\n]*(\S[^\n]*)$",
+    ], s1)
+    time_began = (time_began_base + (" " + preamble_editor_notes if preamble_editor_notes else "")).strip()
+    time_ended = first_match([r"time ended\s*:[^\S\n]*(\S[^\n]*)$"], s1)
+
+    judge_case         = first_match([r"^judge\s*:[^\S\n]*(\S[^\n]*)$"], s1)
+    prosecutor         = first_match([r"^prosecutor\s*:[^\S\n]*(\S[^\n]*)$"], s1)
+    defense_attorney   = first_match([r"^defense attorney\s*:[^\S\n]*(\S[^\n]*)$"], s1)
+
+    # Defense attorney type: strip the long question text if present
+    # Variants seen:
+    #   "Is the defense attorney a Public Defender, private attorney, or other: Unknown"
+    #   "Defense attorney is a: Public Defender"
+    #   "Defense attorney is a Public Defender."   (no colon)
+    #   "The defense attorney is a: Public Defender"
+    #   "The defense attorney is a Public Defender"
+    def_type_raw = first_match([
+        # "Is the defense attorney a ... : <answer>"
+        r"is the defense attorney a[^:]*:\s*\*?\*?(\S[^\n]*)$",
+        # "Defense attorney is a: <answer>"  or  "The defense attorney is a: <answer>"
+        r"(?:the\s+)?defense attorney is an?\s*:\s*\*?\*?(\S[^\n]*)$",
+        # "Defense attorney is a Public Defender."  (no colon before answer)
+        r"(?:the\s+)?defense attorney is an?\s+(\S[^\n]*)$",
+    ], s1)
+    # Strip any residual "Public Defender, private attorney, or other" preamble
+    def_type_raw = re.sub(
+        r"^public defender,\s*private attorney,\s*or other\s*:\s*",
+        "", def_type_raw, flags=re.IGNORECASE,
+    ).strip(" *.")
+    defense_attorney_type = def_type_raw
+
+    accused_initials = first_match([
+        r"accused person(?:\s+full\s+name)?\s*:\s*(\S[^\n]*)$",
+    ], s1)
+    gender_presentation = first_match([
+        r"gender presentation\s*:\s*\*?\*?(\S[^\n]*?)\*?\*?$",
+    ], s1)
+
+    # Perceived race: capture the matching line, then append any immediately
+    # following [Editor's Note: ...] paragraph (scan past blank lines)
+    perceived_race_base = first_match([
+        r"perceived race\s*:\s*\*?\*?(\S[^\n]*?)\*?\*?$",
+    ], s1)
+    editor_note_for_race = ""
+    found_race = False
+    for line in s1_lines:
+        if found_race:
+            stripped = line.strip()
+            if not stripped:
+                continue   # skip blank lines between perceived race and editor note
+            if re.match(r"\[.*editor'?s? note", stripped, re.IGNORECASE):
+                editor_note_for_race = " " + stripped
+            break
+        if re.search(r"perceived race", line, re.IGNORECASE):
+            found_race = True
+    perceived_race = (perceived_race_base + editor_note_for_race).strip()
+
+    pretrial_fta   = first_match([r"failure to appear\s*:\s*(\S[^\n]*)$"], s1)
+    pretrial_nca   = first_match([r"new criminal activity\s*:\s*(\S[^\n]*)$"], s1)
+    pretrial_score = first_match([
+        r"(?:pre-?trial\s+)?supervision score\s*(?:level\s*)?rec(?:ommendation)?\s*:\s*(\S[^\n]*)$",
+    ], s1)
+
+    # ------------------------------------------------------------------ §II
+    s2 = section_blob(secs, 2)
+    primary_charge     = first_match([r"primary charge\s*:\s*\*?\*?\s*(\S[^\n]*)$"], s2)
+    additional_charges = first_match([r"any additional charges\s*:\s*\*?\*?\s*(\S[^\n]*)$"], s2)
+
+    # ------------------------------------------------------------------ §III
+    s3_lines = section_lines(secs, 3)
+
+    # arrest_datetime: value after "When did this occur...?" on the SAME line only.
+    # If nothing follows the question mark, leave blank.
+    arrest_datetime = ""
+    arrest_location = ""
+    reason_for_contact = ""
+    gun_found = ""
+    gun_location = ""
+    other_arrest_facts = ""
+
+    i = 0
+    while i < len(s3_lines):
+        line = s3_lines[i]
+
+        if re.search(r"when did this occur", line, re.IGNORECASE):
+            # value is everything after the "?"
+            m = re.search(r"when did this occur[^?]*\?\s*(\S.*)?$",
+                           line, re.IGNORECASE)
+            if m and m.group(1):
+                arrest_datetime = m.group(1).strip()
+            # else blank – don't grab next line
+
+        elif S3_WHERE_RE.match(line):
+            # value after "Where? " on the SAME line only
+            m = re.search(r"where\s*\?\s*(\S.*)?$", line, re.IGNORECASE)
+            if m and m.group(1):
+                arrest_location = m.group(1).strip()
+            # else blank – do NOT grab next line (which is the contact question)
+
+        elif S3_CONTACT_RE.search(line):
+            # Inline value on same line (e.g. Case 3, 7, 8)?
+            m = re.search(
+                r"what reason did officers give for initiating contact\?\s*(\S.+)?$",
+                line, re.IGNORECASE)
+            inline = (m.group(1) or "").strip() if m else ""
+            parts = [inline] if inline else []
+            j = i + 1
+            while j < len(s3_lines):
+                nxt = s3_lines[j]
+                if S3_GUN_RE.search(nxt):
+                    break
+                stripped = nxt.lstrip("-• \t").strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
+            reason_for_contact = re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+        elif S3_GUN_RE.search(line):
+            m = re.search(r"was a gun found[^:]*:\s*\*?\*?(\S[^\n]*)$",
+                           line, re.IGNORECASE)
+            if m:
+                gun_found = m.group(1).strip().rstrip("* ")
+            else:
+                # answer might be on the very next line
+                if i + 1 < len(s3_lines) and not S3_GUN_LOC_RE.search(s3_lines[i+1]):
+                    candidate = s3_lines[i+1].lstrip("-• \t").strip()
+                    if candidate and not re.search(
+                            r"if yes|where was", candidate, re.IGNORECASE):
+                        gun_found = candidate
+
+        elif S3_GUN_LOC_RE.search(line):
+            # collect the immediately following non-empty line(s) until next sentinel
+            parts = []
+            j = i + 1
+            while j < len(s3_lines):
+                nxt = s3_lines[j]
+                if S3_OTHER_RE.search(nxt) or S3_GUN_RE.search(nxt):
+                    break
+                stripped = nxt.lstrip("-• \t").strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
+            gun_location = re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+        elif S3_OTHER_RE.search(line):
+            parts = []
+            j = i + 1
+            while j < len(s3_lines):
+                stripped = s3_lines[j].lstrip("-• \t").strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
+            other_arrest_facts = re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+        i += 1
+
+    # ------------------------------------------------------------------ §IV
+    # Use ALL paragraph texts including blank lines so collect_narrative
+    # captures everything between narrative headers without gaps.
+    s4_all = [para_text(p) for p in secs.get(4, [])]
+
+    state_narrative   = collect_narrative(s4_all, S4_STATE_RE,   S4_DEFENSE_RE)
+    defense_narrative = collect_narrative(s4_all, S4_DEFENSE_RE, S4_JUDGE_RE)
+    judge_3_prongs    = collect_narrative(s4_all, S4_JUDGE_RE,   None)
+
+    # ------------------------------------------------------------------ §V
+    s5_lines = section_lines(secs, 5)
+
+    family_present          = ""
+    family_who              = ""
+    judge_comments_on_family= ""
+    dependants              = ""
+    other_info_about_person = ""
+
+    i = 0
+    while i < len(s5_lines):
+        line = s5_lines[i]
+
+        if re.search(r"were family/friends present and acknowledged", line, re.IGNORECASE):
+            # value may be inline after "?" — require a real answer (not just punctuation)
+            m = re.search(
+                r"were family/friends present and acknowledged\?[^\S\n]*(\S[^\n]*)$",
+                line, re.IGNORECASE)
+            inline_val = ""
+            if m:
+                candidate = m.group(1).strip().rstrip("*")
+                # Reject bare punctuation artefacts from the label itself
+                if candidate and candidate not in ("?", "*", "**"):
+                    inline_val = candidate
+            if inline_val:
+                family_present = inline_val
+            else:
+                # Look at the next non-blank line
+                j = i + 1
+                while j < len(s5_lines):
+                    candidate = s5_lines[j].strip()
+                    if candidate:
+                        if not S5_WHO_RE.search(candidate):
+                            family_present = candidate
+                        break
+                    j += 1
+
+        elif S5_WHO_RE.search(line):
+            parts = []
+            j = i + 1
+            while j < len(s5_lines):
+                if S5_JUDGE_CMT_RE.search(s5_lines[j]):
+                    break
+                stripped = s5_lines[j].strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
+            family_who = re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+        elif S5_JUDGE_CMT_RE.search(line):
+            parts = []
+            j = i + 1
+            while j < len(s5_lines):
+                if S5_DEPENDANTS_RE.search(s5_lines[j]):
+                    break
+                stripped = s5_lines[j].strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
+            judge_comments_on_family = re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+        elif S5_DEPENDANTS_RE.search(line):
+            # Value after the colon on the same line
+            m = re.search(
+                r"does the accused person have children[^:]*:\s*\*?\*?(\S[^\n]*)$",
+                line, re.IGNORECASE)
+            if m:
+                dependants = m.group(1).strip().rstrip("*")
+            else:
+                # value may be on the next line
+                j = i + 1
+                while j < len(s5_lines):
+                    candidate = s5_lines[j].strip()
+                    if candidate:
+                        if not S5_OTHER_RE.search(candidate):
+                            dependants = candidate
+                        break
+                    j += 1
+
+        elif S5_OTHER_RE.search(line):
+            parts = []
+            j = i + 1
+            while j < len(s5_lines):
+                stripped = s5_lines[j].strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
+            other_info_about_person = re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+        i += 1
+
+    # ------------------------------------------------------------------ §VI
+    s6_lines = section_lines(secs, 6)
+    # Remove trailing "Note to reader" boilerplate
+    outcome_parts = []
+    for line in s6_lines:
+        if re.match(r"note to reader", line, re.IGNORECASE):
+            break
+        outcome_parts.append(line)
+    outcome = re.sub(r"\s+", " ", " ".join(outcome_parts)).strip()
+
+    # ------------------------------------------------------------------ assemble
     return {
-        # Section I
-        "case_number": case_num,
-        "time_hearing_began": time_began,
-        "time_hearing_ended": time_ended,
-        "judge_case": judge_case,
-        "prosecutor": prosecutor,
-        "defense_attorney": defense_attorney,
-        "defense_attorney_type": defense_attorney_type,
-        "accused_person_initials": accused_initials,
+        "case_number"             : case_num,
+        # §I
+        "time_hearing_began"      : time_began,
+        "time_hearing_ended"      : time_ended,
+        "judge_case"              : judge_case,
+        "prosecutor"              : prosecutor,
+        "defense_attorney"        : defense_attorney,
+        "defense_attorney_type"   : defense_attorney_type,
+        "accused_person_initials" : accused_initials,
         "accused_gender_presentation": gender_presentation,
-        "accused_perceived_race": perceived_race,
+        "accused_perceived_race"  : perceived_race,
         "pretrial_failure_to_appear": pretrial_fta,
         "pretrial_new_criminal_activity": pretrial_nca,
         "pretrial_supervision_score": pretrial_score,
-        # Section II
-        "primary_charge": primary_charge,
-        "additional_charges": additional_charges,
-        # Section III
-        "arrest_datetime": arrest_datetime,
-        "arrest_location": arrest_location,
-        "reason_for_contact": reason_for_contact,
-        "gun_found": gun_found,
-        "gun_location": gun_location,
-        "other_arrest_facts": other_arrest_facts,
-        # Section IV
-        "state_narrative": state_narrative,
-        "defense_narrative": defense_narrative,
-        "judge_3_prongs": judge_3_prongs,
-        # Section V
-        "family_present": family_present,
-        "family_who": family_who,
+        # §II
+        "primary_charge"          : primary_charge,
+        "additional_charges"      : additional_charges,
+        # §III
+        "arrest_datetime"         : arrest_datetime,
+        "arrest_location"         : arrest_location,
+        "reason_for_contact"      : reason_for_contact,
+        "gun_found"               : gun_found,
+        "gun_location"            : gun_location,
+        "other_arrest_facts"      : other_arrest_facts,
+        # §IV
+        "state_narrative"         : state_narrative,
+        "defense_narrative"       : defense_narrative,
+        "judge_3_prongs"          : judge_3_prongs,
+        # §V
+        "family_present"          : family_present,
+        "family_who"              : family_who,
         "judge_comments_on_family": judge_comments_on_family,
-        "dependants": dependants,
-        "other_info_about_person": other_info_about_person,
-        # Section VI
-        "outcome": outcome,
+        "dependants"              : dependants,
+        "other_info_about_person" : other_info_about_person,
+        # §VI
+        "outcome"                 : outcome,
     }
 
 
 # ---------------------------------------------------------------------------
 # File processor
 # ---------------------------------------------------------------------------
+
+FIELDNAMES = [
+    # Session metadata
+    "source_file", "documenter_name", "hearing_date",
+    "arrived_at", "left_at",
+    "judge_header", "courtroom_number",
+    "repeated_arguments", "general_observations",
+    "courthouse_navigator", "ability_to_hear",
+    "courtroom_has_windows", "courtroom_type",
+    # Case
+    "case_number",
+    "time_hearing_began", "time_hearing_ended",
+    "judge_case", "prosecutor", "defense_attorney", "defense_attorney_type",
+    "accused_person_initials", "accused_gender_presentation", "accused_perceived_race",
+    "pretrial_failure_to_appear", "pretrial_new_criminal_activity",
+    "pretrial_supervision_score",
+    "primary_charge", "additional_charges",
+    "arrest_datetime", "arrest_location", "reason_for_contact",
+    "gun_found", "gun_location", "other_arrest_facts",
+    "state_narrative", "defense_narrative", "judge_3_prongs",
+    "family_present", "family_who", "judge_comments_on_family",
+    "dependants", "other_info_about_person",
+    "outcome",
+]
+
 
 def process_file(path: Path) -> list[dict]:
     doc = Document(path)
@@ -425,49 +712,27 @@ def process_file(path: Path) -> list[dict]:
     for case_num, paras in case_blocks:
         case_data = parse_case(case_num, paras)
         row = {
-            # Header fields first, in document order
-            "source_file": header["source_file"],
-            "documenter_name": header["documenter_name"],
-            "hearing_date": header["hearing_date"],
-            "arrived_at": header["arrived_at"],
-            "left_at": header["left_at"],
-            "judge_header": header["judge_header"],
-            "courtroom_number": header["courtroom_number"],
-            "courthouse_navigator": header["courthouse_navigator"],
-            "ability_to_hear": header["ability_to_hear"],
+            "source_file"          : header["source_file"],
+            "documenter_name"      : header["documenter_name"],
+            "hearing_date"         : header["hearing_date"],
+            "arrived_at"           : header["arrived_at"],
+            "left_at"              : header["left_at"],
+            "judge_header"         : header["judge_header"],
+            "courtroom_number"     : header["courtroom_number"],
+            "repeated_arguments"   : header["repeated_arguments"],
+            "general_observations" : header["general_observations"],
+            "courthouse_navigator" : header["courthouse_navigator"],
+            "ability_to_hear"      : header["ability_to_hear"],
             "courtroom_has_windows": header["courtroom_has_windows"],
-            "courtroom_type": header["courtroom_type"],
+            "courtroom_type"       : header["courtroom_type"],
             **case_data,
         }
+        # Apply NaN to all blank string values
+        for k, v in row.items():
+            if isinstance(v, str):
+                row[k] = nan_if_empty(v)
         rows.append(row)
     return rows
-
-
-FIELDNAMES = [
-    # Session metadata (header)
-    "source_file", "documenter_name", "hearing_date",
-    "arrived_at", "left_at",
-    "judge_header", "courtroom_number", "courthouse_navigator",
-    "ability_to_hear", "courtroom_has_windows", "courtroom_type",
-    # Section I
-    "case_number",
-    "time_hearing_began", "time_hearing_ended",
-    "judge_case", "prosecutor", "defense_attorney", "defense_attorney_type",
-    "accused_person_initials", "accused_gender_presentation", "accused_perceived_race",
-    "pretrial_failure_to_appear", "pretrial_new_criminal_activity", "pretrial_supervision_score",
-    # Section II
-    "primary_charge", "additional_charges",
-    # Section III
-    "arrest_datetime", "arrest_location", "reason_for_contact",
-    "gun_found", "gun_location", "other_arrest_facts",
-    # Section IV
-    "state_narrative", "defense_narrative", "judge_3_prongs",
-    # Section V
-    "family_present", "family_who", "judge_comments_on_family",
-    "dependants", "other_info_about_person",
-    # Section VI
-    "outcome",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -475,14 +740,13 @@ FIELDNAMES = [
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse court watching docx files to CSV.")
-    parser.add_argument("--input", default="mini_data",
-                        help="Folder containing .docx files (default: ./mini_data)")
-    parser.add_argument("--output", default="output.csv",
-                        help="Output CSV path (default: output.csv)")
+    parser = argparse.ArgumentParser(
+        description="Parse court watching docx files to CSV.")
+    parser.add_argument("--input",  default="mini_data")
+    parser.add_argument("--output", default="output.csv")
     args = parser.parse_args()
 
-    input_dir = Path(args.input)
+    input_dir  = Path(args.input)
     docx_files = sorted(input_dir.glob("*.docx"))
 
     if not docx_files:
