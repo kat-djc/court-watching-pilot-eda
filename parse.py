@@ -16,6 +16,7 @@ import csv
 import argparse
 from pathlib import Path
 from docx import Document
+from collections import defaultdict
 
 NaN = float("nan")
 
@@ -326,27 +327,79 @@ S4_JUDGE_RE   = re.compile(r"judge'?s?\s+3\s+prongs?", re.IGNORECASE)
 
 EDITOR_NOTE_RE = re.compile(r"\[.*?editor\'?s?\s+note", re.IGNORECASE)
 
+def collect_narrative(paragraphs, header_re, stop_re=None):
+    """
+    Collect everything between narrative headers and reconstruct
+    Word numbering hierarchy:
 
-def collect_narrative(all_paras: list, header_re, stop_re) -> str:
+        ilvl=0 -> 1., 2., 3.
+        ilvl=1 -> a., b., c.
+        ilvl=2 -> i., ii., iii.
+
+    Returns a single string.
     """
-    Scan all_paras (raw paragraph texts, including blanks) for the line matching
-    header_re, then collect ALL subsequent lines until stop_re matches or end of
-    list. No content is filtered out. Trailing blank lines are stripped.
-    """
+
     collecting = False
     parts = []
-    for t in all_paras:
+
+    counters = defaultdict(int)
+
+    for para in paragraphs:
+
+        text = para_text(para)
+
         if not collecting:
-            if header_re.search(t):
+            if header_re.search(text):
                 collecting = True
             continue
-        if stop_re and stop_re.search(t):
-            break
-        parts.append(t)
 
-    joined = "\n".join(parts).strip()
-    joined = re.sub(r"\n{3,}", "\n\n", joined)
-    return joined
+        if stop_re and stop_re.search(text):
+            break
+
+        pPr = para._element.pPr
+
+        if (
+            pPr is not None
+            and pPr.numPr is not None
+            and pPr.numPr.ilvl is not None
+        ):
+
+            ilvl = int(pPr.numPr.ilvl.val)
+
+            counters[ilvl] += 1
+
+            # reset deeper levels
+            for lvl in list(counters.keys()):
+                if lvl > ilvl:
+                    counters[lvl] = 0
+
+            if ilvl == 0:
+                prefix = f"{counters[0]}."
+
+            elif ilvl == 1:
+                prefix = f"{chr(96 + counters[1])}."
+
+            elif ilvl == 2:
+                roman = [
+                    "i", "ii", "iii", "iv", "v",
+                    "vi", "vii", "viii", "ix", "x"
+                ]
+                idx = counters[2] - 1
+                prefix = (
+                    f"{roman[idx]}."
+                    if 0 <= idx < len(roman)
+                    else f"{counters[2]}."
+                )
+
+            else:
+                prefix = "-"
+
+            parts.append(f"{prefix} {text}")
+
+        else:
+            parts.append(text)
+
+    return " ".join(parts).strip()
 
 
 def parse_case(case_num: str, paragraphs: list) -> dict:
@@ -525,11 +578,28 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
     # ------------------------------------------------------------------ §IV
     # Use ALL paragraph texts including blank lines so collect_narrative
     # captures everything between narrative headers without gaps.
-    s4_all = [para_text(p) for p in secs.get(4, [])]
 
-    state_narrative   = collect_narrative(s4_all, S4_STATE_RE,   S4_DEFENSE_RE)
-    defense_narrative = collect_narrative(s4_all, S4_DEFENSE_RE, S4_JUDGE_RE)
-    judge_3_prongs    = collect_narrative(s4_all, S4_JUDGE_RE,   None)
+    # ------------------------------------------------------------------ §IV
+
+    s4_paras = secs.get(4, [])
+
+    state_narrative = collect_narrative(
+        s4_paras,
+        S4_STATE_RE,
+        S4_DEFENSE_RE
+    )
+
+    defense_narrative = collect_narrative(
+        s4_paras,
+        S4_DEFENSE_RE,
+        S4_JUDGE_RE
+    )
+
+    judge_3_prongs = collect_narrative(
+        s4_paras,
+        S4_JUDGE_RE,
+        None
+    )
 
     # ------------------------------------------------------------------ §V
     s5_lines = section_lines(secs, 5)
