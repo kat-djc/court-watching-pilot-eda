@@ -315,9 +315,8 @@ S3_OTHER_RE    = re.compile(r"other important facts about the interaction with p
 # Regexes for Section V boundary markers
 S5_WHO_RE       = re.compile(r"who was there\?.*what was shared", re.IGNORECASE)
 S5_JUDGE_CMT_RE = re.compile(r"what comments.*judge make about family", re.IGNORECASE)
-S5_DEPENDANTS_RE = re.compile(
-    r"does the accused person have children/spouse/other dependants/job",
-    re.IGNORECASE)
+S5_DEPENDANTS_RE= re.compile(
+    r"does the accused person have children", re.IGNORECASE)
 S5_OTHER_RE     = re.compile(
     r"what else did you learn about the person", re.IGNORECASE)
 
@@ -608,7 +607,7 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
     family_present          = ""
     family_who              = ""
     judge_comments_on_family= ""
-    dependants_spouse_job              = ""
+    dependants              = ""
     other_info_about_person = ""
 
     i = 0
@@ -664,44 +663,22 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
             judge_comments_on_family = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         elif S5_DEPENDANTS_RE.search(line):
-
-            PROMPT = "does the accused person have children/spouse/other dependants/job"
-
-            collected = []
-
-            # capture anything appearing after the question on the same line
+            # Value after the colon on the same line
             m = re.search(
-                r"does the accused person have children/spouse/other dependants/job\??\s*(.*)$",
-                line,
-                re.IGNORECASE,
-            )
-
+                r"does the accused person have children[^:]*:\s*\*?\*?(\S[^\n]*)$",
+                line, re.IGNORECASE)
             if m:
-                remainder = m.group(1).strip(" :*")
-                if remainder:
-                    collected.append(remainder)
-
-            # capture subsequent lines until the next Section V question
-            j = i + 1
-            while j < len(s5_lines):
-
-                nxt = s5_lines[j].strip()
-
-                if not nxt:
+                dependants = m.group(1).strip().rstrip("*")
+            else:
+                # value may be on the next line
+                j = i + 1
+                while j < len(s5_lines):
+                    candidate = s5_lines[j].strip()
+                    if candidate:
+                        if not S5_OTHER_RE.search(candidate):
+                            dependants = candidate
+                        break
                     j += 1
-                    continue
-
-                if S5_OTHER_RE.search(nxt):
-                    break
-
-                collected.append(nxt)
-                j += 1
-
-            dependants_spouse_job = re.sub(
-                r"\s+",
-                " ",
-                " ".join(collected)
-            ).strip()
 
         elif S5_OTHER_RE.search(line):
             parts = []
@@ -759,7 +736,7 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
         "family_present"          : family_present,
         "family_who"              : family_who,
         "judge_comments_on_family": judge_comments_on_family,
-        "dependants_spouse_job"   : dependants_spouse_job,
+        "dependants"              : dependants,
         "other_info_about_person" : other_info_about_person,
         # §VI
         "outcome"                 : outcome,
@@ -790,7 +767,7 @@ FIELDNAMES = [
     "gun_found", "gun_location", "other_arrest_facts",
     "state_narrative", "defense_narrative", "judge_3_prongs",
     "family_present", "family_who", "judge_comments_on_family",
-    "dependants_spouse_job", "other_info_about_person",
+    "dependants", "other_info_about_person",
     "outcome",
 ]
 
