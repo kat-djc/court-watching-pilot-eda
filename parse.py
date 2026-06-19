@@ -660,7 +660,7 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
             if not inline_val:
                 j = i + 1
                 while j < len(s5_lines):
-                    if S5_JUDGE_CMT_RE.search(s5_lines[j]):
+                    if S5_JUDGE_CMT_RE.search(s5_lines[j]) or S5_DEPENDANTS_RE.search(s5_lines[j]):
                         break
                     stripped = s5_lines[j].strip()
                     if stripped:
