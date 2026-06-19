@@ -351,6 +351,11 @@ def collect_narrative(paragraphs, header_re, stop_re=None):
         if not collecting:
             if header_re.search(text):
                 collecting = True
+                # Extract inline content after the header
+                match = header_re.search(text)
+                inline = text[match.end():].strip().lstrip(":*").strip()
+                if inline:
+                    parts.append(inline)
             continue
 
         if stop_re and stop_re.search(text):
@@ -537,7 +542,7 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
             reason_for_contact = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         elif S3_GUN_RE.search(line):
-            m = re.search(r"was a gun found[^:]*:\s*\*?\*?(\S[^\n]*)$",
+            m = re.search(r"was a gun found[?:]?\s*(\S[^\n]*)$",
                            line, re.IGNORECASE)
             if m:
                 gun_found = m.group(1).strip().rstrip("* ")
@@ -550,17 +555,22 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
                         gun_found = candidate
 
         elif S3_GUN_LOC_RE.search(line):
-            # collect the immediately following non-empty line(s) until next sentinel
-            parts = []
-            j = i + 1
-            while j < len(s3_lines):
-                nxt = s3_lines[j]
-                if S3_OTHER_RE.search(nxt) or S3_GUN_RE.search(nxt):
-                    break
-                stripped = nxt.lstrip("-• \t").strip()
-                if stripped:
-                    parts.append(stripped)
-                j += 1
+            # Check for inline value after "?" on the same line
+            m = re.search(r"where was the gun found[?:]?\s*(\S[^\n]*)$",
+                           line, re.IGNORECASE)
+            inline_val = (m.group(1) or "").strip() if m else ""
+            parts = [inline_val] if inline_val else []
+            # If no inline value, collect the immediately following non-empty line(s)
+            if not inline_val:
+                j = i + 1
+                while j < len(s3_lines):
+                    nxt = s3_lines[j]
+                    if S3_OTHER_RE.search(nxt) or S3_GUN_RE.search(nxt):
+                        break
+                    stripped = nxt.lstrip("-• \t").strip()
+                    if stripped:
+                        parts.append(stripped)
+                    j += 1
             gun_location = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         elif S3_OTHER_RE.search(line):
@@ -639,15 +649,21 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
                     j += 1
 
         elif S5_WHO_RE.search(line):
-            parts = []
-            j = i + 1
-            while j < len(s5_lines):
-                if S5_JUDGE_CMT_RE.search(s5_lines[j]):
-                    break
-                stripped = s5_lines[j].strip()
-                if stripped:
-                    parts.append(stripped)
-                j += 1
+            # Check for inline value after the question marks
+            m = re.search(r"what was shared about the people present\?[^\S\n]*(\S[^\n]*)$",
+                          line, re.IGNORECASE)
+            inline_val = (m.group(1) or "").strip() if m else ""
+            parts = [inline_val] if inline_val else []
+            # If no inline value, collect from following lines
+            if not inline_val:
+                j = i + 1
+                while j < len(s5_lines):
+                    if S5_JUDGE_CMT_RE.search(s5_lines[j]):
+                        break
+                    stripped = s5_lines[j].strip()
+                    if stripped:
+                        parts.append(stripped)
+                    j += 1
             family_who = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         elif S5_JUDGE_CMT_RE.search(line):
