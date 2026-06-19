@@ -288,6 +288,8 @@ def parse_header(paragraphs) -> dict:
             while j < n:
                 if NEXT_HDR.search(lines[j]) and not COURTROOM_TYPE_RE.search(lines[j]):
                     break
+                if re.search(r"court watching notes", lines[j], re.IGNORECASE):
+                    break
                 stripped = lines[j].lstrip("-• \t").strip()
                 if stripped:
                     parts.append(stripped)
