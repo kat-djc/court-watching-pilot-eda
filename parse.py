@@ -49,7 +49,7 @@ def nan_if_empty(val: str):
 # Document-level splitter: paragraphs → header block + per-case blocks
 # ---------------------------------------------------------------------------
 
-CASE_RE = re.compile(r"^\s*[*_]*Case\s*:\s*(\d+)", re.IGNORECASE)
+CASE_RE = re.compile(r"^\s*[*_]*Case\b\s*:\s*(\d+)", re.IGNORECASE)
 
 
 def split_into_cases(doc: Document):
@@ -166,6 +166,7 @@ def parse_header(paragraphs) -> dict:
     header = {
         "source_file"        : "",
         "documenter_name"    : "",
+        "fact_checker"       : "",
         "hearing_date"       : "",
         "arrived_at"         : "",
         "left_at"            : "",
@@ -199,6 +200,9 @@ def parse_header(paragraphs) -> dict:
         # ---- Simple single-line fields ----
         if tl.startswith("documenter name:"):
             header["documenter_name"] = t.split(":", 1)[1].strip()
+
+        elif tl.startswith("fact checker:"):
+            header["fact_checker"] = t.split(":", 1)[1].strip()
 
         elif re.match(r"^date:", t, re.IGNORECASE) and not header["hearing_date"]:
             header["hearing_date"] = t.split(":", 1)[1].strip()
@@ -576,13 +580,19 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
             gun_location = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         elif S3_OTHER_RE.search(line):
-            parts = []
-            j = i + 1
-            while j < len(s3_lines):
-                stripped = s3_lines[j].lstrip("-• \t").strip()
-                if stripped:
-                    parts.append(stripped)
-                j += 1
+            # Check for inline value after the question mark
+            m = re.search(r"other important facts about the interaction with police\?[^\S\n]*(\S[^\n]*)$",
+                          line, re.IGNORECASE)
+            inline_val = (m.group(1) or "").strip() if m else ""
+            parts = [inline_val] if inline_val else []
+            # If no inline value, collect from following lines
+            if not inline_val:
+                j = i + 1
+                while j < len(s3_lines):
+                    stripped = s3_lines[j].lstrip("-• \t").strip()
+                    if stripped:
+                        parts.append(stripped)
+                    j += 1
             other_arrest_facts = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         i += 1
@@ -762,7 +772,7 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
 
 FIELDNAMES = [
     # Session metadata
-    "source_file", "documenter_name", "hearing_date",
+    "source_file", "documenter_name", "fact_checker", "hearing_date",
     "arrived_at", "left_at",
     "judge_header", "courtroom_number",
     "repeated_arguments", "general_observations",
@@ -797,6 +807,7 @@ def process_file(path: Path) -> list[dict]:
         row = {
             "source_file"          : header["source_file"],
             "documenter_name"      : header["documenter_name"],
+            "fact_checker"         : header["fact_checker"],
             "hearing_date"         : header["hearing_date"],
             "arrived_at"           : header["arrived_at"],
             "left_at"              : header["left_at"],
