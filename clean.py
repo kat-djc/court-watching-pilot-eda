@@ -131,6 +131,33 @@ def extract_datetime_components(val):
 
     return date_clean, time_clean
 
+def extract_time(val):
+
+    text = normalize_text(val)
+
+    if is_null_value(text):
+        return pd.NaT
+
+    m = re.search(
+        r'(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?|am|pm)?)',
+        text,
+        flags=re.I
+    )
+
+    if not m:
+        return pd.NaT
+
+    time_text = (
+        m.group(1)
+         .lower()
+         .replace("a.m.", "am")
+         .replace("p.m.", "pm")
+         .replace("a.m", "am")
+         .replace("p.m", "pm")
+    )
+
+    return pd.to_datetime(time_text, errors="coerce")
+
 # ============================================================
 # Judge
 # ============================================================
@@ -636,16 +663,26 @@ def clean_outcome(val):
 
     return np.nan
 
-def clean_electronic_monitoring(val):
+def extract_electronic_monitoring(val):
 
     text = normalize_text(val)
 
     if is_null_value(text):
         return np.nan
 
-    for pattern in EM_PATTERNS:
-        if pattern in text:
-            return "Yes"
+    # must be release context
+    is_released = ("release" in text or "released" in text)
+
+    has_em = (
+        "electronic monitoring" in text
+        or re.search(r"\bem\b", text) is not None
+    )
+
+    if not is_released:
+        return np.nan
+
+    if has_em:
+        return "Yes"
 
     return "No"
 # ============================================================
@@ -662,11 +699,11 @@ df["hearing_date"] = pd.to_datetime(
 df["judge_header_clean"] = df["judge_header"].apply(clean_judge)
 df["judge_case_clean"] = df["judge_case"].apply(clean_judge)
 
-df["arrived_at_clean"] = df["arrived_at"].apply(extract_datetime_components)
-df["left_at_clean"] = df["left_at"].apply(extract_datetime_components)
+df["arrived_at_clean"] = df["arrived_at"].apply(extract_time)
+df["left_at_clean"] = df["left_at"].apply(extract_time)
 
-df["time_hearing_began_clean"] = df["time_hearing_began"].apply(extract_datetime_components)
-df["time_hearing_ended_clean"] = df["time_hearing_ended"].apply(extract_datetime_components)
+df["time_hearing_began_clean"] = df["time_hearing_began"].apply(extract_time)
+df["time_hearing_ended_clean"] = df["time_hearing_ended"].apply(extract_time)
 
 df["ability_to_hear_clean"] = df["ability_to_hear"].apply(clean_ability_to_hear)
 
@@ -712,7 +749,7 @@ df[
 
 df["outcome_clean"] = df["outcome"].apply(clean_outcome)
 
-df["electronic_monitoring_clean"] = df["outcome"].apply(clean_electronic_monitoring)
+df["outcome_clean__electronic_monitoring"] = df["outcome"].apply(extract_electronic_monitoring)
 # ============================================================
 # Save
 # ============================================================
