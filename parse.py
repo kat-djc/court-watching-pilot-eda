@@ -338,7 +338,8 @@ S5_JUDGE_CMT_RE = re.compile(r"what comments.*judge make about family", re.IGNOR
 S5_DEPENDANTS_RE= re.compile(
     r"does the accused person have children", re.IGNORECASE)
 S5_OTHER_RE     = re.compile(
-    r"what else did you learn about the person", re.IGNORECASE)
+    r"what else did you learn about the person who was in front of the court",
+    re.IGNORECASE)
 
 # Narrative headers in Section IV
 S4_STATE_RE   = re.compile(r"state'?s?\s+narrative", re.IGNORECASE)
@@ -705,7 +706,7 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
                     if S5_DEPENDANTS_RE.search(s5_lines[j]):
                         break
                     stripped = s5_lines[j].strip()
-                    if stripped and not re.search(r"\[.*editor", stripped, re.IGNORECASE):
+                    if stripped:
                         parts.append(stripped)
                     j += 1
             judge_comments_on_family = re.sub(r"\s+", " ", " ".join(parts)).strip()
@@ -728,21 +729,23 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
             dependants_spouse_job = " | ".join(parts)
 
         elif S5_OTHER_RE.search(line):
-            # Check for inline value after the last question mark
-            m = re.search(r"\?[^\S\n]*(\S[^\n]*)$", line)
+            # Capture inline text after the question (if any), then collect
+            # every remaining line in Section V — split_into_sections already
+            # bounds this section at the "VI." heading, so this naturally
+            # stops there.
+            m = re.search(r"in front of the court\?[^\S\n]*(\S[^\n]*)$",
+                          line, re.IGNORECASE)
             inline_val = (m.group(1) or "").strip() if m else ""
             # Reject if it's just punctuation/formatting
             if inline_val and re.match(r"^[★\*:]+$", inline_val):
                 inline_val = ""
             parts = [inline_val] if inline_val else []
-            # If no inline value, collect from following lines
-            if not inline_val:
-                j = i + 1
-                while j < len(s5_lines):
-                    stripped = s5_lines[j].strip()
-                    if stripped and not re.search(r"\[.*editor", stripped, re.IGNORECASE):
-                        parts.append(stripped)
-                    j += 1
+            j = i + 1
+            while j < len(s5_lines):
+                stripped = s5_lines[j].strip()
+                if stripped:
+                    parts.append(stripped)
+                j += 1
             other_info_about_person = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         i += 1
