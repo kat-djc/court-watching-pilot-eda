@@ -1,5 +1,5 @@
 """
-parse.py  –  third draft
+parse.py 
 
 Parses a folder of court-watching .docx files into a flat CSV dataset.
 One row per case; header metadata is shared across all cases in the file.
@@ -49,7 +49,17 @@ def nan_if_empty(val: str):
 # Document-level splitter: paragraphs → header block + per-case blocks
 # ---------------------------------------------------------------------------
 
-CASE_RE = re.compile(r"^\s*[*_]*Case\b\s*:\s*(\d+)", re.IGNORECASE)
+CASE_RE = re.compile(r"^\s*[*_]*Cases?\s*:\s*([\d,\s]*\d(?:\s*(?:,|and)\s*\d+)*)",
+                      re.IGNORECASE)
+
+
+def normalize_case_numbers(raw: str) -> str:
+    """
+    Turn '2, 3 and 4' / '2,3,4' / '2' into a clean comma-joined string,
+    e.g. '2, 3, 4'. Used as the case_number field for combined headings.
+    """
+    nums = re.findall(r"\d+", raw)
+    return ", ".join(nums)
 
 
 def split_into_cases(doc: Document):
@@ -57,6 +67,10 @@ def split_into_cases(doc: Document):
     Returns:
         header_paras  : list of paragraphs before the first Case
         case_blocks   : list of (case_number_str, [paragraphs])
+
+    Handles both single-case headings ("Case: 2") and combined headings
+    ("Cases: 2, 3 and 4"). A combined heading is treated as a single block
+    whose case_number_str is a comma-joined list, e.g. "2, 3, 4".
     """
     header_paras = []
     case_blocks  = []
@@ -69,7 +83,7 @@ def split_into_cases(doc: Document):
         if m:
             if current_num is not None:
                 case_blocks.append((current_num, current_paras))
-            current_num   = m.group(1)
+            current_num   = normalize_case_numbers(m.group(1))
             current_paras = [para]
         elif current_num is None:
             header_paras.append(para)
@@ -679,20 +693,30 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
             family_who = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         elif S5_JUDGE_CMT_RE.search(line):
-            parts = []
-            j = i + 1
-            while j < len(s5_lines):
-                if S5_DEPENDANTS_RE.search(s5_lines[j]):
-                    break
-                stripped = s5_lines[j].strip()
-                if stripped:
-                    parts.append(stripped)
-                j += 1
+            # Check for inline value after the question
+            m = re.search(r"judge make about.*?\?[^\S\n]*(\S[^\n]*)$",
+                          line, re.IGNORECASE)
+            inline_val = (m.group(1) or "").strip() if m else ""
+            parts = [inline_val] if inline_val else []
+            # If no inline value, collect from following lines
+            if not inline_val:
+                j = i + 1
+                while j < len(s5_lines):
+                    if S5_DEPENDANTS_RE.search(s5_lines[j]):
+                        break
+                    stripped = s5_lines[j].strip()
+                    if stripped and not re.search(r"\[.*editor", stripped, re.IGNORECASE):
+                        parts.append(stripped)
+                    j += 1
             judge_comments_on_family = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         elif S5_DEPENDANTS_RE.search(line):
+            # Check for inline value after the colon
+            m = re.search(r"have children[^:]*:[^\S\n]*(\S[^\n]*)$",
+                          line, re.IGNORECASE)
+            inline_val = (m.group(1) or "").strip() if m else ""
+            parts = [inline_val] if inline_val else []
             # Collect all bullet points until the next sentinel (S5_OTHER_RE)
-            parts = []
             j = i + 1
             while j < len(s5_lines):
                 if S5_OTHER_RE.search(s5_lines[j]):
@@ -704,13 +728,21 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
             dependants_spouse_job = " | ".join(parts)
 
         elif S5_OTHER_RE.search(line):
-            parts = []
-            j = i + 1
-            while j < len(s5_lines):
-                stripped = s5_lines[j].strip()
-                if stripped:
-                    parts.append(stripped)
-                j += 1
+            # Check for inline value after the last question mark
+            m = re.search(r"\?[^\S\n]*(\S[^\n]*)$", line)
+            inline_val = (m.group(1) or "").strip() if m else ""
+            # Reject if it's just punctuation/formatting
+            if inline_val and re.match(r"^[★\*:]+$", inline_val):
+                inline_val = ""
+            parts = [inline_val] if inline_val else []
+            # If no inline value, collect from following lines
+            if not inline_val:
+                j = i + 1
+                while j < len(s5_lines):
+                    stripped = s5_lines[j].strip()
+                    if stripped and not re.search(r"\[.*editor", stripped, re.IGNORECASE):
+                        parts.append(stripped)
+                    j += 1
             other_info_about_person = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         i += 1
