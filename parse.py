@@ -49,8 +49,20 @@ def nan_if_empty(val: str):
 # Document-level splitter: paragraphs → header block + per-case blocks
 # ---------------------------------------------------------------------------
 
-CASE_RE = re.compile(r"^\s*[*_]*Cases?\s*:?\s*([\d,\s]*\d(?:\s*(?:,|and)\s*\d+)*)",
-                      re.IGNORECASE)
+CASE_RE = re.compile(
+    r"""
+    ^\s*[*_]*
+    Cases?
+    \s*
+    (?:\:|\#)?          # optional ":" or "#"
+    \s*
+    (
+        [\d,\s]*\d
+        (?:\s*(?:,|and)\s*\d+)*
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
 
 
 def normalize_case_numbers(raw: str) -> str:
