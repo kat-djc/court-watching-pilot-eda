@@ -49,7 +49,7 @@ def nan_if_empty(val: str):
 # Document-level splitter: paragraphs → header block + per-case blocks
 # ---------------------------------------------------------------------------
 
-CASE_RE = re.compile(r"^\s*[*_]*Cases?\s*:\s*([\d,\s]*\d(?:\s*(?:,|and)\s*\d+)*)",
+CASE_RE = re.compile(r"^\s*[*_]*Cases?\s*:?\s*([\d,\s]*\d(?:\s*(?:,|and)\s*\d+)*)",
                       re.IGNORECASE)
 
 
@@ -563,52 +563,115 @@ def parse_case(case_num: str, paragraphs: list) -> dict:
             reason_for_contact = re.sub(r"\s+", " ", " ".join(parts)).strip()
 
         elif S3_GUN_RE.search(line):
-            m = re.search(r"was a gun found[?:]?\s*(\S[^\n]*)$",
-                           line, re.IGNORECASE)
+
+            # Try inline answer first
+            m = re.search(
+                r"was a gun found\??\s*:?\s*(.+)$",
+                line,
+                re.IGNORECASE
+            )
+
+            inline_val = ""
+
             if m:
-                gun_found = m.group(1).strip().rstrip("* ")
+                candidate = m.group(1).strip()
+
+                # Ignore punctuation artifacts from label-only lines
+                if candidate not in ("", ":", "?", "?:"):
+                    inline_val = candidate
+
+            if inline_val:
+                gun_found = inline_val
+
             else:
-                # answer might be on the very next line
-                if i + 1 < len(s3_lines) and not S3_GUN_LOC_RE.search(s3_lines[i+1]):
-                    candidate = s3_lines[i+1].lstrip("-• \t").strip()
-                    if candidate and not re.search(
-                            r"if yes|where was", candidate, re.IGNORECASE):
-                        gun_found = candidate
+                # Look for answer on next line
+                j = i + 1
+                while j < len(s3_lines):
+
+                    nxt = s3_lines[j].strip()
+
+                    if not nxt:
+                        j += 1
+                        continue
+
+                    if S3_GUN_LOC_RE.search(nxt):
+                        break
+
+                    gun_found = nxt
+                    break
 
         elif S3_GUN_LOC_RE.search(line):
-            # Check for inline value after "?" on the same line
-            m = re.search(r"where was the gun found[?:]?\s*(\S[^\n]*)$",
-                           line, re.IGNORECASE)
-            inline_val = (m.group(1) or "").strip() if m else ""
+
+            m = re.search(
+                r"where was the gun found\??\s*:?\s*(.+)$",
+                line,
+                re.IGNORECASE
+            )
+
+            inline_val = ""
+
+            if m:
+                candidate = m.group(1).strip()
+
+                # Ignore punctuation-only captures
+                if candidate not in ("", "?", ":"):
+                    inline_val = candidate
+
             parts = [inline_val] if inline_val else []
-            # If no inline value, collect the immediately following non-empty line(s)
+
             if not inline_val:
+
                 j = i + 1
+
                 while j < len(s3_lines):
+
                     nxt = s3_lines[j]
-                    if S3_OTHER_RE.search(nxt) or S3_GUN_RE.search(nxt):
+
+                    if S3_OTHER_RE.search(nxt):
                         break
+
                     stripped = nxt.lstrip("-• \t").strip()
+
                     if stripped:
                         parts.append(stripped)
+
                     j += 1
-            gun_location = re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+            gun_location = re.sub(
+                r"\s+",
+                " ",
+                " ".join(parts)
+            ).strip()
 
         elif S3_OTHER_RE.search(line):
-            # Check for inline value after the question mark
-            m = re.search(r"other important facts about the interaction with police\?[^\S\n]*(\S[^\n]*)$",
-                          line, re.IGNORECASE)
-            inline_val = (m.group(1) or "").strip() if m else ""
-            parts = [inline_val] if inline_val else []
-            # If no inline value, collect from following lines
-            if not inline_val:
+
+            cleaned = re.sub(
+                r"^.*other important facts about the interaction with police\??\s*:?\s*",
+                "",
+                line,
+                flags=re.IGNORECASE | re.DOTALL
+            ).strip()
+
+            parts = [cleaned] if cleaned else []
+
+            if not cleaned:
+
                 j = i + 1
+
                 while j < len(s3_lines):
+
                     stripped = s3_lines[j].lstrip("-• \t").strip()
+
                     if stripped:
                         parts.append(stripped)
+
                     j += 1
-            other_arrest_facts = re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+            other_arrest_facts = re.sub(
+                r"\s+",
+                " ",
+                " ".join(parts)
+            ).strip()
 
         i += 1
 
